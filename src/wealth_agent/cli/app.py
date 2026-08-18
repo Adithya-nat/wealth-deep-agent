@@ -18,7 +18,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from wealth_agent.config import ARTIFACTS_DIR, SETTINGS, Settings
-from wealth_agent.store import RunWorkspace, latest_run
+from wealth_agent.data.store import RunWorkspace, latest_run
 from wealth_agent.verify import Verdict, verify_memo
 
 #: Frozen runs, committed to the repo so every demo step works with the network
@@ -27,6 +27,23 @@ from wealth_agent.verify import Verdict, verify_memo
 ARTIFACT_RUNS = ARTIFACTS_DIR / "runs"
 
 console = Console()
+
+
+def _quiet_third_party_noise() -> None:
+    """Silence log lines that are neither actionable nor ours.
+
+    `mcp.client.streamable_http` warns "Session termination failed: 400" every
+    time a server declines the DELETE that closes a session. Robinhood's servers
+    always decline it. The session is closed regardless, nothing is wrong, and
+    the line appears often enough to bury the output that matters — including,
+    on one run, the OAuth URL a human was supposed to click.
+
+    Scoped to that one logger on purpose. Blanket-silencing third-party warnings
+    is how you stop hearing about the ones that mean something.
+    """
+    import logging
+
+    logging.getLogger("mcp.client.streamable_http").setLevel(logging.ERROR)
 
 DEFAULT_QUESTION = (
     "Give me a wealth review for the last three months: how my portfolio is "
@@ -48,12 +65,31 @@ def _settings(args: argparse.Namespace) -> Settings:
 
 
 async def _run(args: argparse.Namespace) -> int:
+    """Produce a review, showing the work, then hand back a report.
+
+    The old version invoked the agent and printed the memo. Both halves were
+    wrong for a run that takes minutes: `ainvoke` shows nothing until it is
+    finished, and a 200-line memo in scrollback is not a deliverable anyone
+    would read. This streams the run into a live panel and ends with a rendered
+    HTML report open in the browser.
+    """
+    import time
+
     from langchain_core.messages import HumanMessage
 
-    from wealth_agent.supervisor import RUBRIC, build_wealth_agent
+    from langgraph.types import Command
+
+    from wealth_agent.agents.common import CALL_LIMITS, truncated_agents
+    from wealth_agent.agents.supervisor import RUBRIC, build_wealth_agent
+    from wealth_agent.cli.approval import ask, pending_from
+    from wealth_agent.middleware.verification_gate import MAX_REVISIONS, revision_request
+    from wealth_agent.cli.progress import RunProgress, track
+    from wealth_agent.reporting.delivery import deliver
+    from wealth_agent.reporting.render import build_report_data, write_report
 
     settings = _settings(args)
-    data_mode = "LIVE — real account" if settings.is_live else "demo fixtures"
+    if getattr(args, "propose_trades", False):
+        settings = Settings(demo_mode=settings.demo_mode, allow_write_tools=True)
     described = {
         "naive": "no skills, no grounding rules, no verification",
         "baseline": "skills + grounding rules, nothing checks them",
@@ -62,7 +98,7 @@ async def _run(args: argparse.Namespace) -> int:
     console.print(
         Panel(
             f"[bold]{args.question}[/bold]\n\n"
-            f"data: {data_mode}\n"
+            f"data: {'LIVE — real account' if settings.is_live else 'demo fixtures'}\n"
             f"agent: [bold]{args.mode}[/bold] — {described}"
             + ("\nresearcher: weakened (smaller model)" if args.weak else ""),
             title="wealth run",
@@ -70,41 +106,161 @@ async def _run(args: argparse.Namespace) -> int:
         )
     )
 
-    evaluations: list[dict[str, Any]] = []
-
-    def on_evaluation(ev: dict[str, Any]) -> None:
-        evaluations.append(ev)
-        colour = {"satisfied": "green", "needs_revision": "yellow"}.get(
-            str(ev.get("result")), "red"
-        )
-        console.print(
-            f"  [{colour}]rubric iteration {ev.get('iteration')}: "
-            f"{ev.get('result')}[/{colour}] — {ev.get('explanation', '')[:160]}"
-        )
-
     bundle = await build_wealth_agent(
         mode=args.mode,
         settings=settings,
         weak_researcher=args.weak,
-        on_rubric_evaluation=on_evaluation if args.mode == "verified" else None,
+        always_judge=getattr(args, "always_judge", False),
     )
-    console.print(f"workspace: [dim]{bundle.workspace.root}[/dim]\n")
+    for source in bundle.degraded:
+        console.print(
+            Panel(
+                f"[bold]{source.server}[/bold] refused the live connection, so this "
+                f"run is using [bold]replay fixtures[/bold] for it.\n\n"
+                f"[dim]{source.fallback_reason}[/dim]\n\n"
+                f"Any figure sourced from {source.server} in the report below is "
+                f"[bold]synthetic[/bold], not your account.",
+                title="[bold yellow]degraded to fixtures[/bold yellow]",
+                border_style="yellow",
+            )
+        )
+    console.print(f"workspace: [dim]{bundle.workspace.root}[/dim]")
 
     payload: dict[str, Any] = {"messages": [HumanMessage(args.question)]}
     if bundle.verified:
         payload["rubric"] = RUBRIC
 
-    result = await bundle.agent.ainvoke(
-        payload,
-        config={"configurable": {"thread_id": bundle.workspace.run_id}},
-        # Long runs with several subagents blow through the default ceiling
-        # well before they are actually stuck.
-        recursion_limit=args.recursion_limit,
+    started = time.monotonic()
+    config = {"configurable": {"thread_id": bundle.workspace.run_id}}
+    progress = RunProgress()
+
+    # One loop, two reasons to go round again.
+    #
+    #   1. The run paused on a write tool and a human has to answer.
+    #   2. Deterministic verification failed and the agent gets the specific
+    #      findings back to fix.
+    #
+    # Both continue the same thread, so the agent keeps everything it had. The
+    # verification half lives here rather than in middleware because
+    # `after_agent` cannot restart a finished agent — see `revision_request`.
+    next_input: Any = payload
+    revisions = 0
+    while True:
+        stream = bundle.agent.astream(
+            next_input,
+            config=config,
+            stream_mode=["updates", "custom"],
+            # Without this, a subagent's events never reach this stream and the
+            # panel shows the supervisor doing everything by itself.
+            subgraphs=True,
+            recursion_limit=args.recursion_limit,
+        )
+        progress = await track(
+            stream, title=f"wealth run · {args.mode}", console=console, progress=progress
+        )
+
+        state = await bundle.agent.aget_state(config)
+        pending = pending_from(getattr(state, "interrupts", ()) or ())
+        if pending:
+            next_input = Command(resume={"decisions": ask(pending)})
+            continue
+
+        if not bundle.verified or revisions >= MAX_REVISIONS:
+            break
+        _report, request = revision_request(bundle.workspace, revisions + 1)
+        if request is None:
+            break
+        revisions += 1
+        next_input = {"messages": [request]}
+
+    elapsed = time.monotonic() - started
+
+    memo = bundle.workspace.read_memo()
+    if not memo:
+        console.print("[red]The run produced no memo.[/red]")
+        return 1
+
+    # Written before the report so the run is auditable even if rendering fails.
+    (bundle.workspace.root / "cost.json").write_text(
+        json.dumps({**bundle.meter.to_json(), "elapsed_seconds": round(elapsed, 1)}, indent=2),
+        encoding="utf-8",
     )
 
-    memo = _resolve_memo(bundle.workspace, result)
-    console.print(Panel(memo or "(no memo produced)", title="memo", border_style="green"))
-    _print_verification(bundle.workspace)
+    data = build_report_data(
+        bundle.workspace,
+        mode=args.mode,
+        meter=bundle.meter,
+        elapsed_seconds=elapsed,
+        truncated=truncated_agents(bundle.meter),
+    )
+    report_path = write_report(data)
+    result = deliver(
+        report_path,
+        open_browser=not getattr(args, "no_open", False),
+        email_to=getattr(args, "email", None),
+    )
+
+    truncated = truncated_agents(bundle.meter)
+    if truncated:
+        console.print(
+            Panel(
+                "[bold]This run did not finish.[/bold]\n\n"
+                + "\n".join(
+                    f"  · [bold]{name}[/bold] reached its ceiling of "
+                    f"{CALL_LIMITS.get(name)} model calls and was stopped mid-task."
+                    for name in truncated
+                )
+                + "\n\nThe memo below is incomplete, and its grounding score only "
+                "describes the part that got written. Do not read it as a finished "
+                "review.\n\n[dim]Raise the ceiling in agents/common.py, or find out "
+                "why the agent is looping.[/dim]",
+                title="[bold red]truncated[/bold red]",
+                border_style="red",
+            )
+        )
+
+    verification = data.verification
+    colour = "green" if verification.passed else "yellow"
+
+    # Say out loud that verification ran, how many times, and how it ended.
+    # "verified" is a mode name until the run shows its working.
+    if bundle.verified:
+        if verification.passed:
+            console.print(
+                "\n  [green]✓ verified[/green] — the deterministic check passed"
+                + (f" after {revisions} revision(s)" if revisions else " first time")
+            )
+        else:
+            console.print(
+                f"\n  [yellow]⚠ not fully verified[/yellow] — "
+                f"{len(verification.failures)} claim(s) still failing after "
+                f"{revisions} revision(s). They are flagged in the report."
+            )
+
+    console.print(
+        f"  [{colour}]{verification.score:.1%} grounded[/{colour}]"
+        f"  ·  {verification.checked} claims checked"
+        f"  ·  [bold]{len(verification.failures)}[/bold] need a human"
+    )
+    console.print(
+        f"  {elapsed / 60:.1f} min  ·  {progress.tokens / 1000:,.0f}k tokens"
+        f"  ·  [bold]${bundle.meter.cost():.2f}[/bold]"
+        f"  ·  {bundle.meter.cache_hit_rate:.0%} served from cache"
+    )
+    from wealth_agent.voice import lint as voice_lint
+
+    voice = voice_lint(memo)
+    if voice:
+        console.print(
+            f"  [dim]{len(voice)} phrase(s) read as machine-written "
+            f"— see the report. Style only; grounding is unaffected.[/dim]"
+        )
+
+    console.print(f"  report: [bold]{report_path}[/bold]" + ("  [dim](opened)[/dim]" if result.opened else ""))
+    if result.emailed_to:
+        console.print(f"  emailed to [bold]{result.emailed_to}[/bold]")
+    elif result.email_error:
+        console.print(f"  [yellow]email not sent — {result.email_error}[/yellow]")
     console.print(f"\n[dim]run id: {bundle.workspace.run_id}[/dim]")
     return 0
 
@@ -267,6 +423,178 @@ def _inspect(args: argparse.Namespace) -> int:
     return 0
 
 
+
+# --------------------------------------------------------------------------
+# report / cost / compare / doctor / menu
+# --------------------------------------------------------------------------
+
+
+def _report(args: argparse.Namespace) -> int:
+    """Render a report from any run, with zero model calls.
+
+    This is how the report design gets iterated on for free, and it is the
+    demo-safe path when the network is gone: every frozen artifact can produce
+    its report offline.
+    """
+    from wealth_agent.cli.menu import choose_run
+    from wealth_agent.reporting.delivery import deliver
+    from wealth_agent.reporting.render import build_report_data, write_report
+
+    ws = _resolve_workspace(args) if (args.run or args.artifact) else choose_run("Which report?")
+    if ws is None:
+        return 1
+    if not ws.read_memo():
+        console.print(f"[yellow]{ws.run_id} has no memo to report on.[/yellow]")
+        return 1
+
+    path = write_report(build_report_data(ws, mode=args.mode or "verified"))
+    result = deliver(path, open_browser=not args.no_open, email_to=args.email)
+    console.print(f"\n  report: [bold]{path}[/bold]" + ("  [dim](opened)[/dim]" if result.opened else ""))
+    if result.emailed_to:
+        console.print(f"  emailed to [bold]{result.emailed_to}[/bold]")
+    elif result.email_error:
+        console.print(f"  [yellow]email not sent — {result.email_error}[/yellow]")
+    return 0
+
+
+def _cost(args: argparse.Namespace) -> int:
+    """What a run cost, and — the number that matters — how much was cached."""
+    import json
+
+    ws = _resolve_workspace(args)
+    if ws is None:
+        console.print("[red]no runs found.[/red]")
+        return 1
+    path = ws.root / "cost.json"
+    if not path.exists():
+        console.print(
+            f"[yellow]{ws.run_id} has no cost record.[/yellow] "
+            "Only runs made after the cost meter landed have one."
+        )
+        return 1
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    table = Table(title=f"cost · {ws.run_id}", border_style="cyan")
+    for column, justify in (
+        ("agent", "left"), ("model", "left"), ("calls", "right"),
+        ("input", "right"), ("cached", "right"), ("output", "right"), ("cost", "right"),
+    ):
+        table.add_column(column, justify=justify)
+    for agent, usage in data["by_agent"].items():
+        table.add_row(
+            agent, usage["model"], str(usage["calls"]),
+            f"{usage['input_tokens']:,}", f"{usage['cache_read']:,}",
+            f"{usage['output_tokens']:,}", f"${usage['cost_usd']:.3f}",
+        )
+    console.print(table)
+
+    rate = data["cache_hit_rate"]
+    colour = "green" if rate > 0.5 else "yellow" if rate > 0.1 else "red"
+    console.print(
+        f"\n  total: [bold]{data['total_tokens']:,}[/bold] tokens  ·  "
+        f"[bold]${data['total_cost_usd']:.2f}[/bold]  ·  "
+        f"[{colour}]{rate:.0%} served from cache[/{colour}]"
+    )
+    if rate < 0.1:
+        console.print(
+            "  [yellow]A cache hit rate this low means caching is not working.[/yellow]\n"
+            "  [dim]Either a prefix changes between turns, or it is below the model's\n"
+            "  minimum cacheable size — see MIN_CACHEABLE_TOKENS in models.py.[/dim]"
+        )
+    return 0
+
+
+def _compare(args: argparse.Namespace) -> int:
+    """The workshop's central result, offline and free."""
+    from wealth_agent.config import ARTIFACTS_DIR
+    from wealth_agent.verify import Verdict, verify_memo
+
+    described = {
+        "naive": "no skills, no grounding rules, no verification",
+        "baseline": "skills + rules, nothing checks them",
+        "verified": "+ verifier subagent and runtime rubric",
+        "ledger-bug": "the middleware bug this repo caught in itself",
+    }
+    table = Table(title="same subagents, same tools, same data, same question", border_style="cyan")
+    table.add_column("configuration")
+    table.add_column("grounding", justify="right")
+    table.add_column("citations", justify="right")
+    table.add_column("unsupported", justify="right")
+    table.add_column("fabricated", justify="right")
+    table.add_column("ships?", justify="center")
+    for label in ("naive", "baseline", "verified", "ledger-bug"):
+        ws = RunWorkspace(run_id=label, base=ARTIFACTS_DIR / "runs")
+        memo = ws.read_memo()
+        if not memo:
+            continue
+        report = verify_memo(memo, ws)
+        unsupported = sum(1 for f in report.failures if f.verdict is Verdict.UNSUPPORTED)
+        cites = report.checked_citations
+        table.add_row(
+            f"[bold]{label}[/bold]\n[dim]{described.get(label, '')}[/dim]",
+            f"{report.score:.2%}",
+            f"[red]{cites}[/red]" if cites == 0 else str(cites),
+            str(unsupported),
+            f"[bold red]{len(report.fabricated)}[/bold red]" if report.fabricated else "0",
+            "[green]yes[/green]" if report.passed else "[red]no[/red]",
+        )
+    console.print(table)
+    console.print(
+        "\n  [dim]The naive memo is the one to sit with: it reads best of the three and\n"
+        "  attributes nothing. The most persuasive one was the least defensible,\n"
+        "  and reading it carefully would not have told you.[/dim]\n"
+    )
+    return 0
+
+
+def _doctor(args: argparse.Namespace) -> int:
+    from wealth_agent.cli.doctor import run_doctor
+
+    return run_doctor()
+
+
+def _demo() -> int:
+    from wealth_agent.cli.demo import run_demo
+
+    return run_demo()
+
+
+def _menu(args: argparse.Namespace) -> int:
+    """The zero-knowledge entry point: pick a thing, get asked what it needs."""
+    from wealth_agent.cli.menu import main_menu, run_options
+
+    action = main_menu()
+    if action == "run":
+        options = run_options()
+        return asyncio.run(
+            _run(
+                argparse.Namespace(
+                    question=DEFAULT_QUESTION,
+                    mode=options["mode"],
+                    live=options["live"],
+                    allow_writes=False,
+                    weak=False,
+                    recursion_limit=150,
+                    email=options["email"],
+                    no_open=False,
+                    always_judge=False,
+                    propose_trades=options["propose_trades"],
+                )
+            )
+        )
+    if action == "report":
+        return _report(argparse.Namespace(run=None, artifact=None, mode=None, email=None, no_open=False))
+    if action == "compare":
+        return _compare(args)
+    if action == "cost":
+        return _cost(argparse.Namespace(run=None, artifact=None))
+    if action == "doctor":
+        return _doctor(args)
+    if action == "demo":
+        return _demo()
+    return 0
+
+
 # --------------------------------------------------------------------------
 # auth / mcp
 # --------------------------------------------------------------------------
@@ -274,8 +602,8 @@ def _inspect(args: argparse.Namespace) -> int:
 
 def _auth(args: argparse.Namespace) -> int:
     from wealth_agent.config import BANKING_MCP_URL, TRADING_MCP_URL
-    from wealth_agent.mcp_auth import FileTokenStorage, callback_port_is_free, logout
-    from wealth_agent.mcp_clients import BANKING, TRADING
+    from wealth_agent.mcp_servers.auth import FileTokenStorage, callback_port_is_free, logout
+    from wealth_agent.mcp_servers.clients import BANKING, TRADING
 
     servers = {TRADING: TRADING_MCP_URL, BANKING: BANKING_MCP_URL}
     targets = servers if args.server == "all" else {args.server: servers[args.server]}
@@ -310,7 +638,8 @@ def _auth(args: argparse.Namespace) -> int:
 async def _auth_login(targets: dict[str, str]) -> int:
     from langchain_mcp_adapters.client import MultiServerMCPClient
 
-    from wealth_agent.mcp_auth import build_oauth_provider
+    from wealth_agent.mcp_servers.auth import build_oauth_provider
+    from wealth_agent.mcp_servers.clients import root_cause
 
     for name, url in targets.items():
         console.print(f"\n[bold]{name}[/bold] → {url}")
@@ -321,10 +650,37 @@ async def _auth_login(targets: dict[str, str]) -> int:
         try:
             tools = await client.get_tools(server_name=name)
         except Exception as exc:  # noqa: BLE001 — surface the real reason
-            console.print(f"  [red]failed:[/red] {type(exc).__name__}: {exc}")
+            reason = root_cause(exc)
+            console.print(f"  [red]failed:[/red] {reason}")
+            hint = _auth_hint(reason)
+            if hint:
+                console.print(f"  [yellow]{hint}[/yellow]")
             continue
         console.print(f"  [green]connected[/green] — {len(tools)} tools")
     return 0
+
+
+def _auth_hint(reason: str) -> str:
+    """Translate the two OAuth failures this project actually hits.
+
+    Both are properties of Robinhood's deployment rather than bugs here, and
+    both produce error text that does not suggest a next step on its own.
+    """
+    if "client id not allowed" in reason:
+        return (
+            "The banking server rejects a *cached* token from a "
+            "dynamically-registered client, so the SDK re-runs the browser "
+            "authorization. It usually completes silently if you are logged "
+            "into Robinhood. Approve the tab if one opens; if you skip it, the "
+            "run continues on fixtures for this server rather than dying."
+        )
+    if "does not match expected" in reason:
+        return (
+            "The URL you configured is not this server's canonical resource "
+            "identifier. Point the *_MCP_URL at the host named in the error "
+            "and retry — the SDK enforces RFC 9728 resource matching."
+        )
+    return ""
 
 
 def _mcp_probe(args: argparse.Namespace) -> int:
@@ -332,21 +688,32 @@ def _mcp_probe(args: argparse.Namespace) -> int:
 
 
 async def _probe(args: argparse.Namespace) -> int:
-    from wealth_agent.mcp_clients import BANKING, TRADING, build_client, partition_tools
+    from wealth_agent.mcp_servers.clients import BANKING, TRADING, build_client, load_server_tools
 
     settings = _settings(args)
     client = build_client(settings)
     console.print(f"mode: {'LIVE' if settings.is_live else 'replay fixtures'}\n")
 
+    # The probe lists tools and never calls one, so it deliberately looks at the
+    # *whole* surface including writes — showing what `ALLOW_WRITE_TOOLS=0` is
+    # keeping away from the model is the entire point of this command.
+    surveying = Settings(demo_mode=settings.demo_mode, allow_write_tools=True)
+
     surface: dict[str, Any] = {}
     for server in (TRADING, BANKING):
-        try:
-            tools = await client.get_tools(server_name=server)
-        except Exception as exc:  # noqa: BLE001
-            console.print(f"[red]{server}: {type(exc).__name__}: {exc}[/red]")
-            continue
-        split = partition_tools(tools)
-        table = Table(title=server, border_style="cyan")
+        source = await load_server_tools(server, settings=surveying, client=client)
+        if source.fallback_reason:
+            console.print(f"[yellow]{server}: live refused — {source.fallback_reason}[/yellow]")
+            hint = _auth_hint(source.fallback_reason)
+            if hint:
+                console.print(f"[yellow]  {hint}[/yellow]")
+            console.print("[yellow]  showing the fixture surface instead.[/yellow]")
+        split = source.split
+        tools = split.all
+        table = Table(
+            title=f"{server}  [{'live' if source.live else 'fixtures'}]",
+            border_style="cyan" if source.live or not settings.is_live else "yellow",
+        )
         table.add_column("tool")
         table.add_column("access")
         table.add_column("description", overflow="fold")
@@ -501,6 +868,50 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--recursion-limit", type=int, default=150)
     run.set_defaults(func=lambda a: asyncio.run(_run(a)))
 
+    run.add_argument(
+        "--propose-trades",
+        action="store_true",
+        help=(
+            "Let the agent propose the trades it recommends. Every one stops at a "
+            "human approval prompt; nothing reaches a broker without you."
+        ),
+    )
+    run.add_argument(
+        "--always-judge",
+        action="store_true",
+        help=(
+            "Also run the LLM rubric loop. Off by default: the free deterministic "
+            "gate answers the same question. Turn it on to demo the pattern."
+        ),
+    )
+    run.add_argument("--email", help="Also email the report to this address.")
+    run.add_argument("--no-open", action="store_true", help="Do not open the report in a browser.")
+
+    menu = sub.add_parser("menu", help="Interactive menu. Start here if unsure.")
+    menu.set_defaults(func=_menu)
+
+    report = sub.add_parser("report", help="Render and open a report from any run.")
+    report.add_argument("--run", help="Run id. Omit to pick from a list.")
+    report.add_argument("--artifact", help="Frozen run label.")
+    report.add_argument("--mode", help="Label the report with this mode.")
+    report.add_argument("--email", help="Also email it.")
+    report.add_argument("--no-open", action="store_true")
+    report.set_defaults(func=_report)
+
+    cost = sub.add_parser("cost", help="What a run cost, and how much was cached.")
+    cost.add_argument("--run", help="Run id. Defaults to the most recent.")
+    cost.add_argument("--artifact", help="Frozen run label.")
+    cost.set_defaults(func=_cost)
+
+    compare = sub.add_parser("compare", help="naive vs baseline vs verified. Offline.")
+    compare.set_defaults(func=_compare)
+
+    doctor = sub.add_parser("doctor", help="Pre-flight check before presenting.")
+    doctor.set_defaults(func=_doctor)
+
+    demo = sub.add_parser("demo", help="The workshop walkthrough, one keypress per beat.")
+    demo.set_defaults(func=lambda a: _demo())
+
     verify = sub.add_parser("verify", help="Re-verify a run's memo.")
     verify.add_argument("--run", help="Run id. Defaults to the most recent.")
     verify.add_argument("--artifact", help="Frozen run label, e.g. naive/baseline/verified.")
@@ -553,6 +964,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _quiet_third_party_noise()
     args = build_parser().parse_args(argv)
     return args.func(args)
 

@@ -7,7 +7,7 @@ defect was planted.
 Two properties matter and are easy to lose:
 
 **The evidence is shared and deterministic.** All fixtures verify against the
-same workspace, built from :mod:`wealth_agent.synthetic`. So a fixture labeled
+same workspace, built from :mod:`wealth_agent.data.synthetic`. So a fixture labeled
 "grounded" really is grounded — you can prove it by running the deterministic
 checker over it, which :mod:`wealth_agent.evals.judge_alignment` does as a
 self-test before it grades anything.
@@ -26,8 +26,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from wealth_agent import synthetic as syn
-from wealth_agent.store import RunWorkspace
+from wealth_agent.data import synthetic as syn
+from wealth_agent.data.store import RunWorkspace
 
 #: URL used for the fixture source, so its id is stable across machines.
 FIXTURE_SOURCE_URL = "https://example.test/nvda-q2-fy2027"
@@ -186,7 +186,7 @@ def build_evidence_workspace(base: Path) -> RunWorkspace:
 
 
 def _sid() -> str:
-    from wealth_agent.store import source_id
+    from wealth_agent.data.store import source_id
 
     return source_id(FIXTURE_SOURCE_URL)
 

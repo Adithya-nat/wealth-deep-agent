@@ -72,6 +72,32 @@ _NUMBER_RE = re.compile(
     re.VERBOSE,
 )
 
+#: Typographic minus signs, which models emit constantly and `-?` does not match.
+#: U+2212 MINUS SIGN, U+2013 EN DASH, U+2014 EM DASH, U+2012 FIGURE DASH.
+_UNICODE_MINUS = "\u2212\u2013\u2014\u2012"
+
+#: Rewrite one of those to an ASCII hyphen **only when it is directly attached
+#: to the number it signs** — no space between.
+#:
+#: The narrowness is the whole point. A memo reads
+#: `Apple posted record revenue — $94.04B`, and normalizing that em dash would
+#: turn a real positive figure into `-94.04` and score it unsupported. The
+#: distinction between a dash used as punctuation and a dash used as a sign is
+#: exactly the space that follows it.
+#:
+#: This cost us three false `unsupported` findings on a run: the memo wrote
+#: `\u2212$1,621.90` for a real UNH loss of `-1621.9`, the extractor read it as
+#: `+1621.90`, and nothing in the ledger matched. Every digit was correct and
+#: the checker called it fabricated-adjacent. The verifier is an application
+#: too, and it needed its own test.
+_SIGN_RE = re.compile(f"[{_UNICODE_MINUS}](?=[$\\d])")
+
+
+def _normalize_signs(text: str) -> str:
+    """Make typographic minus signs readable to :data:`_NUMBER_RE`."""
+    return _SIGN_RE.sub("-", text)
+
+
 #: Four-digit years are almost always dates, not claims. Excluding them removes
 #: the single largest source of false positives.
 _YEAR_RANGE = range(1990, 2101)
@@ -91,6 +117,10 @@ class Figure:
     raw: str
     is_currency: bool
     is_percent: bool
+    #: Character offsets into the text this was lifted from. Default to -1 so
+    #: figures built by hand in a test do not have to supply them.
+    start: int = -1
+    end: int = -1
 
     @property
     def is_bare_int(self) -> bool:
@@ -115,7 +145,7 @@ def extract_figures(text: str, *, include_trivial: bool = False) -> list[Figure]
         Figures in document order, duplicates included.
     """
     out: list[Figure] = []
-    for match in _NUMBER_RE.finditer(text):
+    for match in _NUMBER_RE.finditer(_normalize_signs(text)):
         raw = match.group(0)
         tail = text[match.end() : match.end() + 1]
         is_percent = tail == "%"
@@ -135,7 +165,16 @@ def extract_figures(text: str, *, include_trivial: bool = False) -> list[Figure]
                 and abs(value) < _BARE_INT_FLOOR
             ):
                 continue
-        out.append(Figure(value=value, raw=raw, is_currency=is_currency, is_percent=is_percent))
+        out.append(
+            Figure(
+                value=value,
+                raw=raw,
+                is_currency=is_currency,
+                is_percent=is_percent,
+                start=match.start(),
+                end=match.end(),
+            )
+        )
     return out
 
 
@@ -162,6 +201,27 @@ def grounded_values(texts: list[str]) -> set[float]:
 def is_grounded(value: float, grounded: set[float]) -> bool:
     """True if ``value`` matches an observed number in any reasonable rounding."""
     return any(form in grounded for form in _quantize(value))
+
+
+def grounded_index(entries: list[tuple[str, str, str]]) -> dict[float, tuple[str, str]]:
+    """Map every observed number to the first tool result that produced it.
+
+    ``entries`` is ``(agent, tool, content)``. The result is what turns the
+    report's grounding annotation from an assertion into a link: click a figure
+    and see the agent, the tool, and the raw output it came out of.
+
+    First-writer-wins is deliberate. A number often appears in several tool
+    results — `concentration` and `unrealized_pl_summary` both echo a market
+    value — and the earliest observation is the one that actually introduced it
+    to the run. Showing all of them would be noise on a page whose job is to
+    answer one question: where did this come from?
+    """
+    index: dict[float, tuple[str, str]] = {}
+    for agent, tool, content in entries:
+        for fig in extract_figures(content, include_trivial=True):
+            for form in _quantize(fig.value):
+                index.setdefault(form, (agent, tool))
+    return index
 
 
 # --------------------------------------------------------------------------
@@ -247,6 +307,10 @@ class GroundingLedger:
 
     def grounded_values(self) -> set[float]:
         return grounded_values(self.texts())
+
+    def grounded_index(self) -> dict[float, tuple[str, str]]:
+        """Every observed number, mapped to the agent and tool that produced it."""
+        return grounded_index([(e.agent, e.name, e.content) for e in self.entries()])
 
     def by_agent(self) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -337,6 +401,10 @@ class RunWorkspace:
         """Every number the agent legitimately observed this run."""
         return self.ledger.grounded_values()
 
+    def grounded_index(self) -> dict[float, tuple[str, str]]:
+        """Every observed number, mapped to the agent and tool that produced it."""
+        return self.ledger.grounded_index()
+
     def describe(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
@@ -359,6 +427,7 @@ def latest_run(base: Path | None = None) -> RunWorkspace | None:
 
 __all__ = [
     "Figure",
+    "grounded_index",
     "GroundingLedger",
     "LedgerEntry",
     "RUNS_DIR",

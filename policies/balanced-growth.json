@@ -1,0 +1,37 @@
+{
+  "name": "balanced-growth",
+  "description": "A long-horizon growth policy with a bond sleeve and a hard cap on single-name risk. Edit this file and re-run; every recommendation the agent makes is derived from it.",
+  "reviewed": "2026-08-01",
+
+  "asset_class_targets_percent_of_total": {
+    "equity": 85.0,
+    "cash": 15.0
+  },
+
+  "sector_targets_percent_of_equity": {
+    "Information Technology": 25.0,
+    "Broad Market ETF": 28.0,
+    "Fixed Income": 8.0,
+    "Financials": 14.0,
+    "Health Care": 12.0,
+    "Consumer Staples": 8.0,
+    "Energy": 5.0
+  },
+
+  "drift_band_percentage_points": 5.0,
+  "max_single_name_percent_of_total": 10.0,
+  "cash_reserve_months": 4.0,
+  "min_trade_usd": 1000.0,
+
+  "preferred_instruments": {
+    "Fixed Income": "BND",
+    "Broad Market ETF": "VOO"
+  },
+
+  "notes": [
+    "Bands are absolute percentage points, not relative. Information Technology at 31% against a 25% target is inside a 5-point band; at 34.71% it is not.",
+    "The single-name cap is measured against TOTAL portfolio value including cash, while sector targets are measured against EQUITY only. They are different denominators on purpose, and every tool that uses them says which one it used.",
+    "cash_reserve_months multiplies the trailing average monthly spend, so the reserve moves with actual spending rather than being a number someone picked once.",
+    "min_trade_usd stops the agent recommending a $180 rebalancing trade that costs more in spread and attention than the drift it corrects."
+  ]
+}

@@ -9,7 +9,7 @@ hide until the moment you switch to real credentials on stage.
 
 Run it directly to inspect the surface::
 
-    uv run python -m wealth_agent.replay_server --server robinhood_trading --list
+    uv run python -m wealth_agent.mcp_servers.replay_server --server robinhood_trading --list
 
 Tool names and shapes here are modelled on Robinhood's documented agentic
 capabilities. Run ``wealth mcp probe`` against the live servers to capture the
@@ -25,8 +25,8 @@ from typing import Any
 
 from fastmcp import FastMCP
 
-from wealth_agent import synthetic as syn
-from wealth_agent.mcp_clients import BANKING, TRADING
+from wealth_agent.data import synthetic as syn
+from wealth_agent.mcp_servers.clients import BANKING, TRADING
 
 _PORTFOLIO = syn.build_portfolio()
 _TRANSACTIONS = syn.build_transactions()

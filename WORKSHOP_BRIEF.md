@@ -6,6 +6,40 @@ Adithya Natarajan · 45 minutes + 15 minutes Q&A · Python, Deep Agents, LangSmi
 
 ---
 
+## What we will be looking at
+
+Before the topic, the thing itself, because it is easier to argue about
+evaluation when you can see what is being evaluated.
+
+A **wealth memo** is the document an advisor writes before a client review: here
+is what you own, here is where your money went, here is what I think you should
+change, and here is the evidence. Producing one by hand is several hours, most
+of them mechanical.
+
+The demo agent produces one. It reads **positions and balances** from a
+brokerage MCP server, **six months of card transactions** from a banking MCP
+server, and a checked-in **investment policy** saying what the portfolio is
+supposed to look like. It researches the holdings on the open web. Then it
+writes a memo whose recommendations are specific:
+
+> **Trim AAPL by $11,759.48.** Information Technology sits at 34.71% of equity
+> against a 25% target with a 5-point band.
+> **Buy BND for $9,690.92** — funded from that trim, because cash is already
+> $3,158.65 below its four-month reserve floor.
+
+Every dollar figure there was computed by Python. Every market claim carries the
+id of a page that was actually fetched. In the report, every number is clickable
+and names the tool that produced it.
+
+**The value to the customer is not that the memo is fast.** It is that it is
+*checkable*. A wrong figure in a client-facing financial memo is a compliance
+finding, so an agent that saves an analyst three hours of writing and costs a
+reviewer three hours of re-deriving has saved nobody anything. On the last run,
+142 claims were checked automatically and 2 needed a person. That ratio is the
+product, and building it is what this session is about.
+
+---
+
 ## Topic & rationale
 
 Most teams I meet are past "can we build an agent." Their agent works. It plans,
@@ -15,12 +49,11 @@ later, on a question nobody's tutorial answers:
 > **How do you know it's right — and how do you know that next week, after
 > someone changes a prompt?**
 
-This workshop answers that, on a deep agent that produces a financial memo. We
-build three loops:
+This workshop answers that on the agent above. We build three loops:
 
 | Loop | Where it runs | What it catches |
 |---|---|---|
-| **1 — runtime** | inside the agent | Defects in *this* run, before a human sees them. `RubricMiddleware` with a deterministic verifier handed to the grader as a tool. |
+| **1 — runtime** | inside the agent | Defects in *this* run, before a human sees them. A deterministic gate that short-circuits, and an LLM rubric only when it does not. |
 | **2 — offline** | outside the agent | Regressions across runs. LangSmith datasets and experiments, so "did that change help?" has a number. |
 | **0 — the evaluator** | on the judge | An LLM judge is an LLM application. Measure it against human labels *before* you believe a single score it produces. |
 
@@ -41,9 +74,10 @@ throw away the change that mattered most.** That is the session's central
 demonstration, and it is why "we have evals" and "we can trust our evals" are
 different claims.
 
-The domain is personal wealth — a portfolio and card feed reached through
-Robinhood's MCP servers — because it makes the stakes legible. An uncited claim
-in a client-facing financial memo is not a rough edge. It is a finding.
+The domain is personal wealth because it makes the stakes legible. An uncited
+claim in a client-facing financial memo is not a rough edge. It is a finding —
+and once the memo says *sell $11,759 of Apple*, a wrong number stops being
+embarrassing and starts being expensive.
 
 **Why this and not "how to build a deep agent":** that is a tutorial, and
 LangChain already ships a good one. Every team in the room can already build the
@@ -189,7 +223,7 @@ Three configurations, same subagents, same tools, same data, same question:
 
 | configuration | grounding | citations | fabricated | ships? |
 |---|---|---|---|---|
-| **naive** — no skills, no rules, no verification | 90.9% | **0** | 0 | ✗ |
+| **naive** — no skills, no rules, no verification | 92.4% | **0** | 0 | ✗ |
 | **baseline** — skills + grounding rules, nothing checks them | 99.2% | 32 | 0 | ✓ |
 | **verified** — + verifier subagent + runtime rubric loop | 98.6% | 42 | 0 | ✓ |
 
@@ -212,10 +246,41 @@ production. Four things I say out loud:
   a fabricated `12%` through, because a real `11.88%` rounds to 12. Tighten the
   tolerance and honest reformatting starts failing. There is no setting that
   avoids both. That trade-off is the most useful thing in the session.
-- **Verification is not free, and here is the bill.** A verified run cost
-  **1.78M tokens and 17.6 minutes**; the naive one was a fraction of that.
-  Whether that trade is worth making depends entirely on what happens when you
-  are wrong — which is a decision for the room, not for me.
+- **My verification loop detected failures and never fixed them.** The gate ran
+  in `after_agent` and returned the findings as a message, which updates state
+  but cannot restart a finished agent. The panel logged "2 to fix, revising" and
+  the run ended with both fabricated quotes still in the memo. Detection worked;
+  the fix never fired; the logs said otherwise. That is the failure shape worth
+  teaching — a control that reports success it did not achieve is worse than no
+  control, because it buys confidence rather than safety.
+
+- **I capped the agents to control cost, and the cap silently truncated a run.**
+  I set the supervisor's ceiling at 30 model calls because a healthy run used
+  about 30. A run then hit exactly 30, `exit_behavior="end"` stopped it
+  mid-sentence, and the CLI printed a grounding score and a report path as
+  though nothing had happened — the memo ended at an empty `## Portfolio`
+  heading, six of seven todos done, nothing raised. The score was even
+  *plausible*, because a truncated memo makes fewer claims and the ones it
+  makes are the easy ones.
+
+  That is the same failure mode this repo warns about in `transient_errors()`:
+  a safety mechanism converting a loud failure into a quiet wrong answer. Two
+  rules came out of it. **A ceiling that binds during normal operation is set
+  wrong** — these are now roughly 3x observed usage, and they exist to stop a
+  loop that will never terminate, not to shape a run that will. And **hitting
+  one is a defect, not a degradation** — the run now says so above everything
+  else, in the terminal and at the top of the report, because a grounding score
+  computed over half a memo is worse than no score at all.
+
+- **Verification is not free, and here is the bill — and here is what it took
+  to make it affordable.** The first working version cost **1.78M tokens and
+  17.6 minutes**. It now costs **554k tokens, 3.8 minutes, and $0.69**, at
+  *higher* grounding, through caching, model tiering, letting code render the
+  tables, and running the free deterministic check before the paid one. The
+  first attempt at that last change made things 40% *worse* — I added the cheap
+  gate alongside two LLM checks instead of in front of them. Whether the
+  remaining cost is worth it depends on what happens at your company when a memo
+  is wrong, which is a decision for the room, not for me.
 - **I shipped this bug while building it.** `GroundingLedgerMiddleware` was
   installed on the supervisor only. Declarative subagents don't inherit parent
   middleware, so every tool call made *inside* a subagent never reached the
@@ -223,7 +288,7 @@ production. Four things I say out loud:
   actual cash balance — straight from `get_account_balances` — as unsupported,
   because the evidence had been destroyed at the boundary between two context
   windows. That is the exact thesis of this workshop, and the system caught it
-  on itself. Grounding went **79.3% → 99.2%** on the fix, and the frozen
+  on itself. Grounding went **76.6% → 99.2%** on the fix, and the frozen
   before-run is in the repo as `artifacts/runs/ledger-bug`.
 - **One flagged figure was my API's fault, not the model's.** `summarize_period`
   returned a percentage change but not the absolute change, so the agent — quite

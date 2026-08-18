@@ -31,7 +31,7 @@ ships, and it is genuinely good until you ask whether its numbers are real.
 from __future__ import annotations
 
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from deepagents import (
@@ -40,76 +40,44 @@ from deepagents import (
     create_deep_agent,
 )
 from deepagents.backends import FilesystemBackend
-from langchain.agents.middleware import (
-    AgentMiddleware,
-    ModelRetryMiddleware,
-    TodoListMiddleware,
-)
+from langchain.agents.middleware import AgentMiddleware, TodoListMiddleware
 from langgraph.checkpoint.memory import InMemorySaver
 
 from wealth_agent.config import REPO_ROOT, SETTINGS, Settings
-from wealth_agent.ledger_middleware import GroundingLedgerMiddleware
-from wealth_agent.mcp_clients import BANKING, TRADING, build_client, load_tools
-from wealth_agent.store import LEDGER_FILE, SOURCES_DIR, RunWorkspace
-from wealth_agent.subagents import (
+from wealth_agent.middleware.grounding_ledger import GroundingLedgerMiddleware
+from wealth_agent.middleware.verification_gate import VerificationGateMiddleware
+from wealth_agent.mcp_servers.clients import (
+    BANKING,
+    TRADING,
+    ServerTools,
+    build_client,
+    load_server_tools,
+)
+from wealth_agent.data.adapters import resolve_capability_tools
+from wealth_agent.data.store import LEDGER_FILE, SOURCES_DIR, RunWorkspace
+from wealth_agent import prompts
+from wealth_agent.agents.common import call_limit, retry_middleware
+from wealth_agent.agents.registry import (
+    build_allocation_strategist,
     build_analyst_subagents,
     build_verifier_subagent,
 )
+from wealth_agent.policy import Policy, load_policy
+from wealth_agent.tools.allocation import build_allocation_tools
 from wealth_agent.tools import (
     build_portfolio_tools,
     build_research_tools,
     build_spend_tools,
 )
 from wealth_agent.tools.verification import build_verification_tools
-
-DEFAULT_MODEL = "anthropic:claude-sonnet-4-6"
-
-
-def transient_errors() -> tuple[type[Exception], ...]:
-    """Exception types worth retrying, and only those.
-
-    Retrying on bare `Exception` is a trap this repo fell into. A run hit
-    `BadRequestError: your credit balance is too low`, the middleware retried it
-    five times, gave up, and — with the default `on_failure="continue"` —
-    handed the error *string* back to the agent as if it were a model response.
-    The agent dutifully wrote it into the memo. Twelve experiment runs reported
-    `success`, every score came back 0.0, and nothing anywhere said "you are out
-    of credits."
-
-    A billing error, a bad API key, and a malformed request are all permanent.
-    Retrying them wastes time and, worse, converts a loud failure into a quiet
-    wrong answer. Connection drops and rate limits are the retryable ones.
-    """
-    try:
-        from anthropic import (
-            APIConnectionError,
-            APITimeoutError,
-            InternalServerError,
-            RateLimitError,
-        )
-    except ImportError:  # pragma: no cover
-        return (ConnectionError, TimeoutError)
-    return (
-        APIConnectionError,
-        APITimeoutError,
-        InternalServerError,
-        RateLimitError,
-        ConnectionError,
-        TimeoutError,
-    )
-
-#: A deliberately weaker model for the researcher, used by the workshop to make
-#: citation drift reproducible. Compressing six sources into one summary is
-#: where attribution gets lost, and a smaller model loses it every run instead
-#: of one run in twelve. Said out loud during the demo: the honest version of
-#: "here is a bug" is "here is a bug I can reproduce".
-WEAK_RESEARCHER_MODEL = "anthropic:claude-haiku-4-5"
-
-#: The grader for the runtime rubric loop. Smaller than the working model on
-#: purpose — grading against a deterministic tool's output is a much easier job
-#: than producing the analysis, and paying Sonnet prices to read a verdict is
-#: waste.
-DEFAULT_GRADER_MODEL = "anthropic:claude-haiku-4-5"
+from wealth_agent.models import (
+    REASONING_MODEL,
+    WEAK_RESEARCHER_MODEL,
+    WORKING_MODEL,
+    CostMeterMiddleware,
+    RunMeter,
+    build_model,
+)
 
 #: The three configurations the workshop compares.
 #:
@@ -122,66 +90,12 @@ DEFAULT_GRADER_MODEL = "anthropic:claude-haiku-4-5"
 #: nobody built it to be measured.
 MODES = ("naive", "baseline", "verified")
 
-NAIVE_PROMPT = """\
-You are a wealth analyst. Produce a clear, well-written memo about someone's
-finances, covering their portfolio allocation, their spending, and any relevant
-market context.
-
-You do not gather data yourself. You delegate:
-- `portfolio-analyst` — holdings, allocation, concentration, unrealized P/L
-- `spend-analyst` — card spending, categories, merchants, subscriptions, trends
-- `market-researcher` — external context
-
-Plan with `write_todos`, delegate in parallel where tasks are independent, then
-synthesize the findings into a memo. Write it to /memo.md and return it as your
-final message. Make it readable and useful.
-"""
-
-SUPERVISOR_PROMPT = """\
-You are a wealth analyst. You produce a written memo about someone's finances \
-that a human will act on, so every claim in it has to be defensible.
-
-You do not gather data yourself. You delegate:
-- `portfolio-analyst` — holdings, allocation, concentration, unrealized P/L
-- `spend-analyst` — card spending, categories, merchants, subscriptions, trends
-- `market-researcher` — external context, with citable sources
-
-Plan the work with `write_todos` before delegating. Delegate in parallel when \
-tasks are independent — portfolio and spend analysis never depend on each other.
-
-Read `/skills/memo-format/SKILL.md` before writing the memo. It defines the \
-citation and figure rules the memo is checked against.
-
-Absolute rules:
-- Every figure in the memo must come from a tool result reported by a subagent. \
-Never compute, estimate, round, or infer a number yourself. If you want a \
-figure no tool produced, delegate for it or leave it out.
-- Every external claim must carry its source id as [src_xxxxxxxx].
-- State the denominator whenever you report a percentage.
-- If the evidence does not support a conclusion, say what is missing. A memo \
-that says "we could not verify this" is worth more than one that guesses.
-
-Write the finished memo to /memo.md and also return it as your final message.
-"""
-
-VERIFIED_SUFFIX = """\
-
-Before you finish, you MUST delegate the memo to `verifier`. Send it the full \
-memo text. If it reports any `fabricated` finding, or a grounding score below \
-0.95, fix the memo and verify again. Do not return a memo that has not passed.
-"""
-
-RUBRIC = """\
-- Every figure in the memo traces to a recorded tool result (verify_report \
-reports zero `unsupported` figures).
-- Every citation resolves to a source that was actually fetched, and every \
-quoted span appears in the source it is attributed to (zero `fabricated` \
-findings).
-- The overall grounding score from verify_report is at least 0.95.
-- Every percentage states its denominator.
-- The memo covers portfolio allocation, spending, and at least one externally \
-sourced piece of market context.
-"""
+#: Prompts live in `prompts/*.md`, not in this file. The workshop's central
+#: comparison is `diff prompts/supervisor.md prompts/supervisor_naive.md` — two
+#: files that differ only in the discipline they impose — which is a far more
+#: honest demonstration than a branch in the function below.
+RUBRIC = prompts.render("rubric")
+GRADER_PROMPT = prompts.render("rubric_grader")
 
 
 @dataclass
@@ -192,10 +106,17 @@ class AgentBundle:
     workspace: RunWorkspace
     mode: str
     tool_names: dict[str, list[str]]
+    sources: list[ServerTools] = field(default_factory=list)
+    meter: RunMeter = field(default_factory=RunMeter)
 
     @property
     def verified(self) -> bool:
         return self.mode == "verified"
+
+    @property
+    def degraded(self) -> list[ServerTools]:
+        """Servers asked for live data that are answering with fixtures."""
+        return [s for s in self.sources if s.fallback_reason]
 
 
 def _seed_workspace(ws: RunWorkspace) -> None:
@@ -238,10 +159,13 @@ async def build_wealth_agent(
     mode: str = "baseline",
     workspace: RunWorkspace | None = None,
     settings: Settings | None = None,
-    model: str = DEFAULT_MODEL,
+    policy: Policy | None = None,
+    model: Any = None,
     weak_researcher: bool = False,
-    grader_model: str = DEFAULT_GRADER_MODEL,
+    grader_model: Any = None,
     on_rubric_evaluation: Any = None,
+    meter: RunMeter | None = None,
+    always_judge: bool = False,
 ) -> AgentBundle:
     """Build the supervisor and its subagents.
 
@@ -274,18 +198,48 @@ async def build_wealth_agent(
         raise ValueError(msg)
     verified = mode == "verified"
     settings = settings or SETTINGS
+    meter = meter if meter is not None else RunMeter()
+    policy = policy or load_policy()
+
+    # Constructed here rather than passed as strings, because a string cannot
+    # carry the caching configuration and caching is the largest single lever
+    # on what this run costs. See `models.py`.
+    model = model if model is not None else build_model(REASONING_MODEL)
+    grader_model = grader_model if grader_model is not None else build_model(WORKING_MODEL)
+    #: The analysts call four deterministic tools and write a paragraph, and the
+    #: verifier reads a verdict off one. Neither improves with a frontier model,
+    #: because the numbers come from Python either way.
+    analyst_model = build_model(WORKING_MODEL)
+
+    #: The strategist is the exception, and it is worth being explicit about why.
+    #: Its arithmetic comes from `rebalance_plan` like everything else — but it
+    #: is the only agent making a *judgement* a human then acts on with money:
+    #: which drifts matter, which to leave alone, how to explain the trade-off
+    #: when two policy rules disagree. Tiering is for jobs where a smaller model
+    #: reaches the same answer. This is not one of them, and saving two cents on
+    #: the recommendation is a bad trade at any volume.
+    strategist_model = model
     ws = workspace or RunWorkspace()
     _seed_workspace(ws)
 
     client = build_client(settings)
-    trading = await load_tools(TRADING, settings=settings, client=client)
-    banking = await load_tools(BANKING, settings=settings, client=client)
+    # Per server, not per run: the two Robinhood servers have different
+    # admission policies, so "am I on live data?" has two answers.
+    sources = [
+        await load_server_tools(TRADING, settings=settings, client=client),
+        await load_server_tools(BANKING, settings=settings, client=client),
+    ]
+    trading, banking = (s.split for s in sources)
 
     by_name = {t.name: t for t in [*trading.all, *banking.all]}
+    # Fixture names pass straight through; live ones route via the schema
+    # adapter. The analytics layer below never learns which it got.
+    capabilities = resolve_capability_tools(by_name)
     portfolio_tools = build_portfolio_tools(
-        ws, by_name["get_positions"], by_name["get_account_balances"]
+        ws, capabilities["positions"], capabilities["balances"]
     )
-    spend_tools = build_spend_tools(ws, by_name["get_card_transactions"])
+    spend_tools = build_spend_tools(ws, capabilities["card_transactions"])
+    allocation_tools = build_allocation_tools(ws, policy)
     research_tools = build_research_tools(ws)
     verification_tools = build_verification_tools(ws)
 
@@ -298,47 +252,66 @@ async def build_wealth_agent(
         # subagents are compiled with their own stack and do not inherit the
         # `middleware` passed below. See build_analyst_subagents' docstring.
         ledger=ws.ledger,
-        researcher_model=WEAK_RESEARCHER_MODEL if weak_researcher else None,
+        analyst_model=analyst_model,
+        researcher_model=build_model(WEAK_RESEARCHER_MODEL) if weak_researcher else None,
+        meter=meter,
+    )
+    # The strategist runs after both analysts, so it is a subagent the
+    # supervisor calls rather than one that fans out in parallel with them.
+    subagents.append(
+        build_allocation_strategist(allocation_tools, strategist_model, ws.ledger, meter)
     )
 
     middleware: list[AgentMiddleware] = [
         TodoListMiddleware(),
-        # A long run makes hundreds of model calls across four agents. Over
-        # seventeen minutes, the probability that *none* of them hits a
-        # transient connection error is not close to one — and without a retry,
-        # a single dropped socket at minute fourteen discards the whole run and
-        # everything it cost.
-        #
-        # `retry_on` is scoped and `on_failure="error"` is explicit. See
-        # transient_errors() for why: the defaults turn a permanent failure into
-        # a silent wrong answer, which is worse than the crash they prevent.
-        ModelRetryMiddleware(
-            max_retries=4,
-            initial_delay=2.0,
-            max_delay=30.0,
-            retry_on=transient_errors(),
-            on_failure="error",
-        ),
+        retry_middleware(),
+        call_limit("supervisor"),
         GroundingLedgerMiddleware(ws.ledger, agent_name="supervisor"),
+        CostMeterMiddleware(meter, agent_name="supervisor"),
     ]
 
-    prompt = NAIVE_PROMPT if mode == "naive" else SUPERVISOR_PROMPT
+    prompt = prompts.render("supervisor_naive" if mode == "naive" else "supervisor")
     if verified:
-        subagents.append(build_verifier_subagent(verification_tools, model))
-        prompt += VERIFIED_SUFFIX
-        middleware.append(
-            RubricMiddleware(
-                model=grader_model,
-                # The grader gets the deterministic checker as a tool rather
-                # than being asked to eyeball groundedness. Giving a judge the
-                # ability to gather evidence turns "does this look right?" into
-                # "what does the check say?", which is a far easier question and
-                # a far more stable answer.
-                tools=verification_tools,
-                max_iterations=2,
-                on_evaluation=on_rubric_evaluation,
+        # The free check runs first and short-circuits. On a clean memo the
+        # verifier subagent and the rubric grader below never execute, which is
+        # this module's own stated principle applied to its own control flow.
+        middleware.append(VerificationGateMiddleware(ws))
+        subagents.append(build_verifier_subagent(verification_tools, analyst_model, meter))
+        prompt += "\n" + prompts.render("supervisor_verified_suffix")
+        if always_judge:
+            # The LLM grading loop, on demand rather than by default.
+            #
+            # It used to run on every verified run, alongside a verifier
+            # subagent the prompt delegated to unconditionally — three
+            # verification systems for one memo. They thrashed: the gate asked
+            # for a revision, the rubric asked for a different one, and the
+            # verifier was re-invoked after each, which is how a "cost saving"
+            # change made a run 40% more expensive than the version it replaced.
+            #
+            # The deterministic gate above answers the same question for free
+            # and answers it better, because it names lines. This stays because
+            # the workshop teaches the rubric pattern and because a judge does
+            # catch things code cannot — but it is opt-in, which is what the
+            # rest of this repo argues for.
+            middleware.append(
+                RubricMiddleware(
+                    model=grader_model,
+                    # The built-in grader prompt does not state the one
+                    # invariant its own response schema enforces — `satisfied`
+                    # requires every criterion to have passed. A smaller grader
+                    # violates it often enough to matter: the structured-output
+                    # validator rejects the response, the iteration is
+                    # discarded, and the run burns a turn producing nothing.
+                    system_prompt=GRADER_PROMPT,
+                    # The grader gets the deterministic checker as a tool rather
+                    # than being asked to eyeball groundedness. That turns "does
+                    # this look right?" into "what does the check say?", a far
+                    # easier question with a far more stable answer.
+                    tools=verification_tools,
+                    max_iterations=2,
+                    on_evaluation=on_rubric_evaluation,
+                )
             )
-        )
 
     # Write tools stay behind a human gate whether or not they are visible.
     # `ALLOW_WRITE_TOOLS` controls visibility; this controls execution. Two
@@ -372,18 +345,19 @@ async def build_wealth_agent(
             "portfolio": [t.name for t in portfolio_tools],
             "spend": [t.name for t in spend_tools],
             "research": [t.name for t in research_tools],
+            "allocation": [t.name for t in allocation_tools],
             "verification": [t.name for t in verification_tools],
             "mcp_read": trading.names()["read"] + banking.names()["read"],
             "mcp_write_gated": write_tool_names,
         },
+        sources=sources,
+        meter=meter,
     )
 
 
 __all__ = [
-    "DEFAULT_GRADER_MODEL",
-    "DEFAULT_MODEL",
+    "GRADER_PROMPT",
     "RUBRIC",
-    "WEAK_RESEARCHER_MODEL",
     "AgentBundle",
     "build_wealth_agent",
 ]

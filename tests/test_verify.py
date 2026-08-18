@@ -11,7 +11,12 @@ from pathlib import Path
 
 import pytest
 
-from wealth_agent.store import RunWorkspace, extract_figures, is_grounded
+from wealth_agent.data.store import (
+    RunWorkspace,
+    extract_figures,
+    grounded_values,
+    is_grounded,
+)
 from wealth_agent.verify import Verdict, verify_memo
 
 
@@ -153,3 +158,54 @@ def test_is_grounded_matches_rounded_forms() -> None:
     grounded = {7864.5, 7864.5, 7865.0}
     assert is_grounded(7864.5, grounded)
     assert not is_grounded(7900.0, grounded)
+
+
+# --------------------------------------------------------------------------
+# Typographic minus signs
+#
+# A run scored 97.54% with three `unsupported` findings, all of them the same
+# true figure: the memo wrote `−$1,621.90` (U+2212) for a UNH loss the ledger
+# held as `-1621.9`. `_NUMBER_RE` only matched an ASCII hyphen, so the
+# extractor read `+1621.90` and nothing matched. The checker is an application
+# too, and it needed its own test.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("−$1,621.90", -1621.90),  # MINUS SIGN
+        ("–$1,621.90", -1621.90),  # EN DASH
+        ("—$1,621.90", -1621.90),  # EM DASH
+        ("-$1,621.90", -1621.90),  # plain hyphen, unchanged
+        ("(−22.61%)", -22.61),
+    ],
+)
+def test_typographic_minus_signs_are_read_as_negative(text: str, expected: float) -> None:
+    figures = extract_figures(text)
+    assert figures, f"nothing extracted from {text!r}"
+    assert figures[0].value == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Apple posted record revenue — $94.04B for the quarter",
+        "Spending rose – $7,729.45 of it was one airline",
+    ],
+)
+def test_a_dash_used_as_punctuation_does_not_negate_the_next_figure(text: str) -> None:
+    """The narrow rule earns its keep here.
+
+    Normalizing every dash would turn these real positive figures negative and
+    score them unsupported. A dash that signs a number is attached to it; a
+    dash that punctuates a sentence has a space after it.
+    """
+    assert all(f.value > 0 for f in extract_figures(text))
+
+
+def test_a_negative_figure_grounds_against_its_negative_tool_value() -> None:
+    """End to end: the exact failure from the run that prompted this fix."""
+    grounded = grounded_values(['{"symbol": "UNH", "unrealized_pl": -1621.90}'])
+    (figure,) = extract_figures("UNH is down −$1,621.90 on the position")
+    assert is_grounded(figure.value, grounded)

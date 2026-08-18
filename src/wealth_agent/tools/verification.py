@@ -17,7 +17,7 @@ from typing import Any
 
 from langchain_core.tools import BaseTool, tool
 
-from wealth_agent.store import RunWorkspace
+from wealth_agent.data.store import RunWorkspace
 from wealth_agent.verify import verify_memo
 
 

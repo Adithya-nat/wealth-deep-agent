@@ -12,7 +12,7 @@ Two rules govern this module:
   as on real data. A fixture that fails validation teaches you nothing.
 
 The shipped fixtures under ``artifacts/`` are synthetic rather than redacted
-(see :mod:`wealth_agent.synthetic`), so this module is what you reach for when
+(see :mod:`wealth_agent.data.synthetic`), so this module is what you reach for when
 capturing *your own* account for private iteration.
 """
 

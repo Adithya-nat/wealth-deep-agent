@@ -3,11 +3,16 @@
 45 minutes delivery + 15 Q&A. Every command below runs offline against frozen
 artifacts. **Nothing in this session requires a live model call.**
 
+> **`make demo` walks this whole script**, one keypress per beat, running each
+> command for you. Use it and this document becomes your notes rather than your
+> checklist — which also means the script cannot drift from what the commands
+> actually do.
+
 ## Before you start
 
 ```bash
-uv sync && uv run pytest -q          # 72 passed
-uv run wealth artifacts list         # naive / baseline / verified / ledger-bug
+make setup       # install, then pre-flight
+make doctor      # keys, prompts, policy, fixtures — all green?
 ```
 
 Windows to have open: terminal, editor on `src/wealth_agent/`, LangSmith on the
@@ -21,8 +26,9 @@ makes the point about demo discipline better than a slide would.
 
 ## 0:00–0:04 — The ship gate
 
-Open `artifacts/runs/naive/memo.md`. Scroll it slowly. Let them read the
-action-items table at the bottom.
+Open the naive report in a browser — `uv run wealth report --artifact naive`.
+Scroll it slowly. Let them read the action-items table at the bottom, and notice
+that every figure on the page is underlined and clickable.
 
 > "This is a wealth memo an agent wrote. Compliance signs off Monday. You're the
 > tech lead. What do you need before you say yes?"
@@ -33,7 +39,7 @@ figures and about twenty external claims.
 Then:
 
 ```bash
-uv run wealth verify --artifact naive
+make demo   # beat 1, or: uv run wealth report --artifact naive
 ```
 
 **Land it on `citations checked: 0`.** Not the grounding score — the zero.
@@ -48,7 +54,7 @@ uv run wealth verify --artifact naive
 
 ## 0:04–0:13 — The architecture
 
-Open `src/wealth_agent/supervisor.py`. Scroll the docstring, then the
+Open `src/wealth_agent/agents/supervisor.py`. Scroll the docstring, then the
 `create_deep_agent` call at the bottom. One screen, every decision visible.
 
 ```bash
@@ -57,7 +63,9 @@ uv run wealth mcp probe
 
 Point at the read/write split.
 
-Then `src/wealth_agent/subagents.py` — the table at the top.
+Then `ls src/wealth_agent/agents/` — one file per agent, so the directory
+listing is the architecture. Open `verifier.py` and `allocation_strategist.py`
+side by side: two agents that are deliberately *not* deep agents.
 
 > "A subagent is a context window with a job. Three of these are deep agents
 > because their work is open-ended. The verifier is a plain `create_agent` ReAct
@@ -69,6 +77,12 @@ Then `src/wealth_agent/subagents.py` — the table at the top.
 **If someone asks "why deep agents at all?"** — one sentence: filesystem for
 context offload, subagents for context isolation, todos for planning. Don't
 teach the framework; they can read the docs. Move on.
+
+**The prompts are files.** `ls src/wealth_agent/prompts/` — and the naive/careful
+comparison you are about to make is `diff supervisor.md supervisor_naive.md`,
+two files that differ only in the discipline they impose. Worth ten seconds:
+a prompt in a Python string cannot be diffed, reviewed, or owned by the
+compliance person whose wording it actually is.
 
 ---
 
@@ -82,9 +96,12 @@ Show it collapse to one subagent.
 > "Forty-plus spans across four agents. Nobody reads this top to bottom. The
 > first thing you do is collapse it to the agent you suspect."
 
-Then show the token count: **1.78M tokens, 17.6 minutes** for the verified run.
+Then show the token count. The first working version of this run was **1.78M
+tokens and 17.6 minutes**; it is now **554k tokens, 3.8 minutes, $0.69** at
+higher grounding.
 
-> "Hold onto that number. We'll come back to what it bought."
+> "Hold onto both numbers. We'll come back to what the difference bought — and
+> to the change I made that accidentally went the wrong way."
 
 ---
 
@@ -102,7 +119,7 @@ ls artifacts/runs/baseline/sources/
 
 > "That's the agent's working memory. It's a directory. You can `ls` it."
 
-Open `src/wealth_agent/ledger_middleware.py`.
+Open `src/wealth_agent/middleware/grounding_ledger.py`.
 
 > "The obvious way to build this is to have each tool write its own ledger
 > entry. That works until someone adds the eleventh tool and forgets — and the
@@ -124,7 +141,7 @@ This is the strongest five minutes in the session. Do not skip it.
 uv run wealth verify --artifact ledger-bug
 ```
 
-79.28%. Point at `$18,420.55` reported as unsupported.
+76.58%. Point at `$18,420.55` reported as unsupported.
 
 > "That's the cash balance. It came straight out of `get_account_balances`. It's
 > real. So why did my own verifier call it unsupported?"
@@ -152,7 +169,7 @@ uv run wealth verify --artifact baseline    # 99.24%
 ## 0:29–0:36 — Loop 0: evaluate the evaluator
 
 ```bash
-uv run wealth evals self-test
+make judge
 ```
 
 > "Twenty labeled memos. Before I grade anything with a model, I check the
@@ -196,17 +213,35 @@ To run it live if asked: `uv run wealth evals judge-align` (~3 min).
 **Loop 2 — offline.** LangSmith → Datasets → `wealth-agent-memo-questions` →
 the two experiments → **Compare**.
 
-**Now cash the token number:**
+**Now cash the cost number:**
 
-> "Verification cost 1.78 million tokens and seventeen minutes. Naive was a
-> fraction of that. I'm not going to tell you that's worth it — that depends
-> entirely on what happens at your company when a memo is wrong. But you can
-> only have that argument if you can put both numbers on the table."
+```bash
+make cost
+```
+
+> "Here is the bill, per agent, with the cache hit rate. This run cost about a
+> dollar and change. The first version of this repo cost seven-fifty, and the
+> difference is three things: caching the prefix, putting the agents whose job
+> is 'call four tools and summarize' on a smaller model, and — the one that
+> matters most — running the free deterministic check *first* so that on a clean
+> memo the LLM verifier and the rubric grader never execute at all."
+
+> "That last one is this workshop's own argument applied to its own control
+> flow. I was calling a judge on every run, including the runs where code had
+> nothing to complain about. The argument was right and my implementation
+> didn't follow it."
+
+Then the report footer:
+
+> "142 claims checked by machine, 2 needed a human. **That ratio is the
+> product.** Whether verification is worth it depends on what happens at your
+> company when a memo is wrong — but you can only have that argument once both
+> numbers are on the table."
 
 **Loop 2 in CI:**
 
 ```bash
-uv run pytest -q
+make test
 ```
 
 > "72 tests, no keys, no network. The grounding threshold is one of them. A
@@ -225,6 +260,63 @@ Close on:
 > moment it arrives. And measure your judge before you believe it."
 
 ---
+
+## What the buyer asks (as opposed to the developer)
+
+The Q&A below this one is what a curious engineer asks. These are what the
+person who has to approve the spend asks, and they arrive in roughly this order.
+Answer them in their terms, not in yours.
+
+**"What does this actually do?"** — It reads a brokerage account, six months of
+card spending, and a written investment policy, and produces a memo that says
+what to move and why. An analyst doing that by hand spends hours per client, and
+most of it is mechanical. This does it in about five minutes.
+
+**"How do I know it's right?"** — Every number in the memo is checked against the
+tool output it came from, before anyone reads it. Open the report and click a
+figure: it names the tool that produced it. On the last run, 142 claims were
+checked automatically and 2 needed a person. *That ratio is the product.* The
+memo being fast is worth much less than the memo being checkable — without the
+second part a human has to re-derive everything, and you have moved the work
+rather than removed it.
+
+**"What happens when it's wrong?"** — Two different failures, deliberately
+labelled differently. *Unsupported* means nothing recorded backs a figure; it
+may well be true and nobody can currently tell. *Fabricated* means it cites a
+source that does not say that — a citation to a page never fetched, or a quote
+that is not in the page it is attributed to. The first is a question for a
+reviewer. The second is a defect. Collapsing them into one "fail" throws away
+the only signal that tells you which is which.
+
+**"What does a run cost?"** — About a dollar, and `make cost` breaks it down per
+agent with the cache hit rate. Every agent also has a hard ceiling on model
+calls, so the answer to "how expensive can one run get?" is a number rather than
+a shrug.
+
+**"Can it touch my money?"** — Not without you. Demo mode is the default: you opt
+*in* to a real account, never out of it. Order placement has two independent
+switches — one controls whether the model can see those tools at all, the other
+controls whether they can execute without a human — because "the model can see
+it" and "it happens without me" are different risks. And unknown tools are
+classified as writes, so a new order type shipped by the broker is gated by
+default rather than admitted silently.
+
+**"Our data can't leave the building."** — Self-hosted LangSmith exists,
+input/output masking exists, and this entire demo runs offline against
+generated data. Ninety seconds, then offer to go deeper afterwards — this
+question derails a session if you let it expand in the room.
+
+**"How long until this works on our agent?"** — Two weeks, in this order. Week
+one: record every tool result via middleware, build a twenty-example labeled set
+from real traces, get one deterministic check into CI. Week two: add a judge
+only where code cannot reach, measure it against the labels, put a threshold on
+the merge. The order is the advice — most teams start with the judge and never
+build the substrate underneath it.
+
+**"What would you cut if we had one day?"** — The judge. Record evidence, write
+one deterministic check, wire it to CI. That is the eighty percent, and it is
+the part that still works when you change models.
+
 
 ## Q&A prep
 

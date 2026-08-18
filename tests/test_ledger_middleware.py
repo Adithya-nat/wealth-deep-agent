@@ -8,8 +8,8 @@ from pathlib import Path
 import pytest
 from langchain_core.messages import ToolMessage
 
-from wealth_agent.ledger_middleware import NON_EVIDENCE_TOOLS, GroundingLedgerMiddleware
-from wealth_agent.store import RunWorkspace, is_grounded
+from wealth_agent.middleware.grounding_ledger import NON_EVIDENCE_TOOLS, GroundingLedgerMiddleware
+from wealth_agent.data.store import RunWorkspace, is_grounded
 
 
 class _Request:
@@ -89,9 +89,9 @@ async def test_every_subagent_records_to_the_ledger() -> None:
     This asserts on configuration rather than on a live run so it costs no
     tokens and fails at the moment someone adds a fourth subagent.
     """
-    from wealth_agent.ledger_middleware import GroundingLedgerMiddleware
-    from wealth_agent.store import GroundingLedger
-    from wealth_agent.subagents import build_analyst_subagents
+    from wealth_agent.middleware.grounding_ledger import GroundingLedgerMiddleware
+    from wealth_agent.data.store import GroundingLedger
+    from wealth_agent.agents.registry import build_analyst_subagents
 
     import tempfile
 
@@ -112,3 +112,77 @@ async def test_every_subagent_records_to_the_ledger() -> None:
         # Entries must be attributable, or "which subagent saw this number?"
         # becomes unanswerable at exactly the moment it matters.
         assert recorders[0].agent_name == spec["name"]
+
+
+# --------------------------------------------------------------------------
+# Prompt caching
+#
+# `create_deep_agent` appends `AnthropicPromptCachingMiddleware` unconditionally
+# and does not deduplicate. Adding a second instance to raise the TTL therefore
+# stacks rather than replaces, and Anthropic rejects the request outright:
+#
+#   cache_control: a ttl='1h' cache_control block must not come after a
+#   ttl='5m' cache_control block.
+#
+# The docs say declaring it explicitly "replaces the default 5m TTL". In this
+# version it does not. The failure only surfaces as a 400 on the first live
+# model call, which makes it a bug you pay for twice — once in credits, once in
+# the demo it interrupts — so it is worth an offline assertion.
+# --------------------------------------------------------------------------
+
+
+def _caching_middleware_names(middleware: list) -> list[str]:
+    return [
+        type(m).__name__
+        for m in middleware
+        if "PromptCaching" in type(m).__name__
+    ]
+
+
+def test_we_do_not_stack_a_second_prompt_caching_middleware() -> None:
+    """Our own middleware list must not contain one; deepagents adds it."""
+    from wealth_agent.data.store import GroundingLedger
+    from wealth_agent.agents.common import subagent_middleware
+
+    import tempfile
+    from pathlib import Path
+
+    ledger = GroundingLedger(Path(tempfile.mkdtemp()) / "ledger.jsonl")
+    assert _caching_middleware_names(subagent_middleware(ledger, name="x")) == []
+
+
+def test_deepagents_still_supplies_exactly_one_caching_middleware() -> None:
+    """Pins the upstream behaviour this repo relies on.
+
+    If a future deepagents stops appending it, caching silently disappears and
+    every run costs several times more with nothing in the output to say so.
+    If it ever appends two, requests start failing. Either way we want to hear
+    about it from a test rather than from a bill or a 400.
+    """
+    from deepagents.middleware._prompt_caching import append_prompt_caching_middleware
+
+    middleware: list = []
+    append_prompt_caching_middleware(middleware)
+    assert _caching_middleware_names(middleware) == ["AnthropicPromptCachingMiddleware"]
+
+
+def test_no_module_declares_its_own_caching_middleware() -> None:
+    """The mistake this guards against, stated directly.
+
+    Raising the TTL by passing a second instance reads as the obvious fix — the
+    docs even describe it as replacing the default — and it produces a 400 on
+    the first live model call, long after the tests pass.
+    """
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1] / "src" / "wealth_agent"
+    offenders = [
+        path.name
+        for path in src.rglob("*.py")
+        if "AnthropicPromptCachingMiddleware(" in path.read_text(encoding="utf-8")
+    ]
+    assert offenders == [], (
+        f"{offenders} construct a caching middleware; deepagents already appends "
+        f"one at a 5m TTL and does not deduplicate, so a second stacks and "
+        f"Anthropic rejects the mismatched ttl ordering."
+    )
