@@ -28,7 +28,7 @@ from wealth_agent.evals.evaluators import (
     no_fabrications,
 )
 from wealth_agent.evals.fixtures import build_fixtures
-from wealth_agent.store import RunWorkspace
+from wealth_agent.data.store import RunWorkspace
 
 MEMO_DATASET = "wealth-agent-memo-questions"
 JUDGE_DATASET = "wealth-agent-judge-fixtures"
@@ -147,8 +147,8 @@ def _evaluators() -> list[Any]:
 async def _run_agent(question: str, *, mode: str, weak_researcher: bool) -> dict[str, Any]:
     from langchain_core.messages import HumanMessage
 
-    from wealth_agent.cli import _resolve_memo
-    from wealth_agent.supervisor import RUBRIC, build_wealth_agent
+    from wealth_agent.cli.app import _resolve_memo
+    from wealth_agent.agents.supervisor import RUBRIC, build_wealth_agent
 
     bundle = await build_wealth_agent(mode=mode, weak_researcher=weak_researcher)
     payload: dict[str, Any] = {"messages": [HumanMessage(question)]}

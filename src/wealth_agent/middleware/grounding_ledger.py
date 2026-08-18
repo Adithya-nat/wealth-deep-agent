@@ -25,7 +25,8 @@ from langchain.agents.middleware import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
-from wealth_agent.store import GroundingLedger
+from wealth_agent.data.store import GroundingLedger
+from wealth_agent.middleware.events import tool_started
 
 #: Tools whose results are agent bookkeeping rather than evidence about the
 #: world. Recording them would flood the grounded set with todo text and file
@@ -121,6 +122,7 @@ class GroundingLedgerMiddleware(AgentMiddleware):
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
     ) -> ToolMessage | Command[Any]:
+        tool_started(self.agent_name, request.tool_call["name"])
         result = handler(request)
         self._record(request, result)
         return result
@@ -130,6 +132,7 @@ class GroundingLedgerMiddleware(AgentMiddleware):
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
     ) -> ToolMessage | Command[Any]:
+        tool_started(self.agent_name, request.tool_call["name"])
         result = await handler(request)
         self._record(request, result)
         return result

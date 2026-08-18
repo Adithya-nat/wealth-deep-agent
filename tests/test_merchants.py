@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from wealth_agent.merchants import (
+from wealth_agent.data.merchants import (
     UNCATEGORIZED,
     clean_descriptor,
     merchant_key,
     normalize,
 )
-from wealth_agent.synthetic import build_transactions
+from wealth_agent.data.synthetic import build_transactions
 
 
 @pytest.mark.parametrize(

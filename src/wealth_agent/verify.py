@@ -37,7 +37,7 @@ from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from wealth_agent.store import Figure, RunWorkspace, extract_figures, is_grounded
+from wealth_agent.data.store import Figure, RunWorkspace, extract_figures, is_grounded
 
 
 class Verdict(StrEnum):
@@ -65,13 +65,24 @@ _SKIP_LINE_RE = re.compile(r"^\s*(#{1,6}\s|\||[-*_]{3,}\s*$|```)")
 
 @dataclass
 class Finding:
-    """One thing the verifier has an opinion about."""
+    """One thing the verifier has an opinion about.
+
+    ``start`` and ``end`` are character offsets into the memo. They exist so the
+    HTML report can wrap the exact span in a verdict-coloured element rather
+    than re-finding the claim with a second regex — a report that highlights a
+    *different* occurrence of "34.71%" than the one that was checked would be
+    worse than one that highlights nothing.
+    """
 
     verdict: Verdict
     kind: str  # "citation" | "figure"
     detail: str
     excerpt: str
     line: int
+    start: int = -1
+    end: int = -1
+    #: For a grounded figure: the agent and tool whose output contains it.
+    grounded_by: tuple[str, str] | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {**asdict(self), "verdict": str(self.verdict)}
@@ -199,6 +210,8 @@ def check_citations(memo: str, workspace: RunWorkspace) -> list[Finding]:
                 detail=detail,
                 excerpt=excerpt,
                 line=lineno,
+                start=match.start(),
+                end=match.end(),
             )
         )
     return findings
@@ -207,9 +220,12 @@ def check_citations(memo: str, workspace: RunWorkspace) -> list[Finding]:
 def check_figures(memo: str, workspace: RunWorkspace) -> list[Finding]:
     """Verify every figure in the memo traces to something the agent observed."""
     grounded = workspace.grounded_values()
+    index = workspace.grounded_index()
     findings: list[Finding] = []
 
+    offset = 0
     for lineno, line in enumerate(memo.splitlines(), start=1):
+        line_start, offset = offset, offset + len(line) + 1
         if _SKIP_LINE_RE.match(line):
             continue
         for fig in extract_figures(line):
@@ -227,9 +243,50 @@ def check_figures(memo: str, workspace: RunWorkspace) -> list[Finding]:
                     ),
                     excerpt=line.strip(),
                     line=lineno,
+                    start=line_start + fig.start if fig.start >= 0 else -1,
+                    end=line_start + fig.end if fig.end >= 0 else -1,
+                    grounded_by=_evidence_for(fig.value, index)
+                    if verdict is Verdict.GROUNDED
+                    else None,
                 )
             )
     return findings
+
+
+#: Below this, a whole number is too common to attribute to one tool.
+#:
+#: The report credited Apple's "8% revenue growth" to
+#: `spend-analyst · load_spend_data`, because an unrelated 8 appeared in the
+#: spend feed first and the index is first-writer-wins. The grounding verdict
+#: was right — an 8 really was observed — but the pointer sent a reviewer to
+#: the wrong evidence, which is worse than sending them nowhere.
+#:
+#: A figure earns a named source when it is distinctive: it has a fractional
+#: part, or it is large enough that a coincidental match is unlikely. Small
+#: round integers stay grounded and simply do not claim a source.
+_DISTINCTIVE_FLOOR = 100.0
+
+
+def _is_distinctive(value: float) -> bool:
+    return not float(value).is_integer() or abs(value) >= _DISTINCTIVE_FLOOR
+
+
+def _evidence_for(
+    value: float, index: dict[float, tuple[str, str]]
+) -> tuple[str, str] | None:
+    """The agent and tool that first observed a value, when that is meaningful.
+
+    Returns ``None`` for values too common to attribute — see
+    :data:`_DISTINCTIVE_FLOOR`.
+    """
+    from wealth_agent.data.store import _quantize
+
+    if not _is_distinctive(value):
+        return None
+    for form in _quantize(value):
+        if form in index:
+            return index[form]
+    return None
 
 
 def verify_memo(memo: str, workspace: RunWorkspace) -> VerificationReport:

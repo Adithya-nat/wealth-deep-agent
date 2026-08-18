@@ -34,7 +34,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from wealth_agent.store import RunWorkspace
+from wealth_agent.data.store import RunWorkspace
 from wealth_agent.verify import verify_memo
 
 # --------------------------------------------------------------------------

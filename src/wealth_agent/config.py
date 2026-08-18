@@ -33,7 +33,7 @@ TRADING_MCP_URL = os.getenv(
     "ROBINHOOD_TRADING_MCP_URL", "https://agent.robinhood.com/mcp/trading"
 )
 BANKING_MCP_URL = os.getenv(
-    "ROBINHOOD_BANKING_MCP_URL", "https://agent.robinhood.com/mcp/banking"
+    "ROBINHOOD_BANKING_MCP_URL", "https://banking-agent.robinhood.com/mcp/banking"
 )
 
 

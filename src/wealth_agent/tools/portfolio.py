@@ -15,7 +15,7 @@ from typing import Any
 
 from langchain_core.tools import BaseTool, tool
 
-from wealth_agent.store import PORTFOLIO_DIR, RunWorkspace
+from wealth_agent.data.store import PORTFOLIO_DIR, RunWorkspace
 from wealth_agent.tools.spend import _parse_mcp_json
 
 POSITIONS_FILE = "positions.json"
@@ -66,8 +66,21 @@ def build_portfolio_tools(
             account_number: Defaults to the primary individual account.
         """
         args = {"account_number": account_number} if account_number else {}
-        positions = _parse_mcp_json(await get_positions.ainvoke(args))
-        balances = _parse_mcp_json(await get_balances.ainvoke(args))
+        # Returned, not raised — see the note in `spend.load_spend_data`. An
+        # upstream that answers badly must not unwind through the subagent and
+        # take the whole run with it.
+        try:
+            positions = _parse_mcp_json(await get_positions.ainvoke(args))
+            balances = _parse_mcp_json(await get_balances.ainvoke(args))
+        except Exception as exc:  # noqa: BLE001 — surfaced to the agent
+            return {
+                "error": f"could not load the portfolio: {type(exc).__name__}: {exc}",
+                "positions_loaded": 0,
+                "guidance": (
+                    "Holdings are unavailable for this run. Say so plainly and do not "
+                    "estimate any position, weight, or total."
+                ),
+            }
 
         rows = positions.get("positions", [])
         (ws.root / PORTFOLIO_DIR / POSITIONS_FILE).write_text(
@@ -150,6 +163,18 @@ def build_portfolio_tools(
                 {
                     "symbol": r["symbol"],
                     "unrealized_pl": r["unrealized_pl"],
+                    # The same figure without its sign, because "UNH is down
+                    # $1,621.90" is correct English that the grounding checker
+                    # cannot see: it extracts +1621.90 and the ledger holds
+                    # -1621.90, so a true sentence is flagged as unsupported.
+                    #
+                    # The repo's own rule applies here — when verification
+                    # flags a figure, ask first whether some tool should have
+                    # returned it. Loosening the checker to match a positive
+                    # against a negative would be the other fix, and in a
+                    # financial memo a sign error is the last thing you want a
+                    # checker to start tolerating.
+                    "unrealized_pl_abs": abs(r["unrealized_pl"]),
                     "unrealized_pl_percent": r["unrealized_pl_percent"],
                     "cost_basis": r["cost_basis"],
                     "market_value": r["market_value"],

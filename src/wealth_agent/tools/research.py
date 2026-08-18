@@ -29,7 +29,7 @@ import httpx
 from langchain_core.tools import BaseTool, tool
 from markdownify import markdownify
 
-from wealth_agent.store import RunWorkspace
+from wealth_agent.data.store import RunWorkspace
 
 #: How much of a fetched page the model sees inline. Enough to judge relevance
 #: and locate a quote; not enough to tempt it into summarizing from the preview.

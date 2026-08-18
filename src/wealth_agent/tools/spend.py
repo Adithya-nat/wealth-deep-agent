@@ -28,8 +28,8 @@ from typing import Any
 
 from langchain_core.tools import BaseTool, tool
 
-from wealth_agent.merchants import NON_SPEND_CATEGORIES, normalize
-from wealth_agent.store import SPEND_DIR, RunWorkspace
+from wealth_agent.data.merchants import NON_SPEND_CATEGORIES, normalize
+from wealth_agent.data.store import SPEND_DIR, RunWorkspace
 
 CACHE_FILE = "transactions.json"
 
@@ -101,8 +101,28 @@ def build_spend_tools(ws: RunWorkspace, get_transactions: Any) -> list[BaseTool]
             args["start_date"] = start_date
         if end_date:
             args["end_date"] = end_date
-        raw = await get_transactions.ainvoke(args)
-        payload = _parse_mcp_json(raw)
+        # Returned rather than raised, for the same reason `fetch_page` returns
+        # a dead link: an upstream that answers badly is information the agent
+        # should route around, not a reason to discard the whole run.
+        #
+        # We learned this the expensive way. A live banking server replied with
+        # newline-delimited JSON, the parser raised, and the exception unwound
+        # through the subagent, through the `task` tool, and out of the
+        # supervisor — killing a run that had already paid for portfolio
+        # analysis and market research. Nothing was salvageable and nothing was
+        # reported except a traceback.
+        try:
+            payload = _parse_mcp_json(await get_transactions.ainvoke(args))
+        except Exception as exc:  # noqa: BLE001 — surfaced to the agent, not swallowed
+            return {
+                "error": f"could not load card transactions: {type(exc).__name__}: {exc}",
+                "transactions_loaded": 0,
+                "guidance": (
+                    "The spend feed is unavailable for this run. Report that spending "
+                    "analysis could not be performed and continue with the rest of the "
+                    "review. Do not estimate spending figures."
+                ),
+            }
 
         rows = []
         for row in payload.get("transactions", []):
@@ -355,23 +375,90 @@ def build_spend_tools(ws: RunWorkspace, get_transactions: Any) -> list[BaseTool]
     ]
 
 
+def _decode_documents(text: str) -> list[Any]:
+    """Every JSON document in a string, not just the first.
+
+    The live Robinhood banking server answers with newline-delimited JSON — one
+    object per line — and `json.loads` on that raises
+    `Extra data: line 2 column 1`. The fixture server returns a single object.
+    Both are legal MCP; the content block is just text, and nothing in the
+    protocol says it holds exactly one document.
+
+    `raw_decode` walks the string instead of assuming, so a header object
+    followed by rows and a single envelope both parse.
+    """
+    decoder = json.JSONDecoder()
+    documents: list[Any] = []
+    index, length = 0, len(text)
+    while index < length:
+        while index < length and text[index] in " \t\r\n":
+            index += 1
+        if index >= length:
+            break
+        document, index = decoder.raw_decode(text, index)
+        documents.append(document)
+    return documents
+
+
+def _merge_documents(documents: list[Any]) -> dict[str, Any]:
+    """Fold several JSON documents into the one envelope callers expect.
+
+    List-valued keys concatenate, because that is what a paged or streamed feed
+    is doing when it sends several objects. Scalars are first-wins: the first
+    document is the envelope and later ones are continuations.
+
+    A stream of bare records with no envelope is wrapped as ``transactions``,
+    which is the key every caller of this function looks for.
+    """
+    if not documents:
+        # An empty body is a failed response, not an empty result. Letting it
+        # through as `{"transactions": []}` would put "you spent $0.00" in a
+        # memo and ground it perfectly, because zero really is what the tool
+        # returned. Distinguishing "nothing came back" from "nothing happened"
+        # is the entire difference between a bug and a finding.
+        msg = "the server returned an empty response"
+        raise ValueError(msg)
+
+    if len(documents) == 1 and isinstance(documents[0], dict):
+        return documents[0]
+
+    dicts = [d for d in documents if isinstance(d, dict)]
+    if dicts and all(not any(isinstance(v, list) for v in d.values()) for d in dicts):
+        looks_like_records = all("id" in d or "amount" in d or "date" in d for d in dicts)
+        if looks_like_records:
+            return {"transactions": dicts}
+
+    merged: dict[str, Any] = {}
+    for document in dicts:
+        for key, value in document.items():
+            if isinstance(value, list):
+                merged.setdefault(key, []).extend(value)
+            else:
+                merged.setdefault(key, value)
+    if merged:
+        return merged
+    return {"transactions": [d for d in documents if isinstance(d, dict)]}
+
+
 def _parse_mcp_json(raw: Any) -> dict[str, Any]:
     """Decode an MCP tool result into a dict.
 
     MCP returns content blocks, and `langchain-mcp-adapters` surfaces them as a
     list of ``{"type": "text", "text": "<json>"}``. Tolerating every shape here
-    keeps the callers from each growing their own unwrapping logic.
+    keeps the callers from each growing their own unwrapping logic — and the
+    live and fixture servers genuinely differ, so "every shape" includes
+    newline-delimited JSON. See `_decode_documents`.
     """
     if isinstance(raw, dict):
         return raw
     if isinstance(raw, str):
-        return json.loads(raw)
+        return _merge_documents(_decode_documents(raw))
     if isinstance(raw, list):
         for block in raw:
             if isinstance(block, dict) and block.get("type") == "text":
-                return json.loads(block["text"])
+                return _merge_documents(_decode_documents(block["text"]))
             if isinstance(block, str):
-                return json.loads(block)
+                return _merge_documents(_decode_documents(block))
     msg = f"Unexpected MCP result shape: {type(raw)!r}"
     raise TypeError(msg)
 

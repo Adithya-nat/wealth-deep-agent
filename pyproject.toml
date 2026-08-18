@@ -21,6 +21,8 @@ dependencies = [
     "pandas>=3.0.5",
     "pydantic>=2.13.4",
     "python-dotenv>=1.2.3",
+    "pyyaml>=6.0",
+    "resend>=2.0",
     "rich>=15.0.0",
     "tavily-python>=0.7.27",
 ]

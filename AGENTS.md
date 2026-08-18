@@ -25,11 +25,13 @@ current; a blog post is neither.
 ## Architecture in one paragraph
 
 A supervisor deep agent delegates to three deep subagents (`portfolio-analyst`,
-`spend-analyst`, `market-researcher`) and one deliberately shallow one
-(`verifier`, a plain `create_agent` ReAct loop). Data reaches the agent through
+`spend-analyst`, `market-researcher`) and two deliberately shallow ones
+(`allocation-strategist` and `verifier`, plain `create_agent` ReAct loops).
+One file per agent under `src/wealth_agent/agents/`; every prompt is a file
+under `src/wealth_agent/prompts/`. Data reaches the agent through
 two Robinhood MCP servers, replayed from fixtures in demo mode. Everything a
 tool returns is recorded to an append-only ledger by middleware, which is what
-makes the memo's claims checkable afterwards. See `src/wealth_agent/supervisor.py`.
+makes the memo's claims checkable afterwards. See `src/wealth_agent/agents/supervisor.py`.
 
 ## Conventions
 
